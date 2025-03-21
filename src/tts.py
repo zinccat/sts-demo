@@ -7,7 +7,7 @@ import numpy as np
 import sounddevice as sd
 from openai import OpenAI
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional
+from typing import Optional
 
 # Load the API key from the environment
 load_dotenv()
@@ -100,10 +100,11 @@ def stream_audio(
     text: str,
     model: str = "gpt-4o-mini-tts",
     voice: str = "alloy",
-    instructions: Optional[Dict[str, Any]] = None,
+    instructions: Optional[str] = None,
 ):
     """
-    Streams audio from the OpenAI TTS API, puts the MP3 chunks onto a queue, and starts the FFmpeg decoder.
+    Streams audio from the OpenAI TTS API, writes the MP3 chunks to a file, puts them onto a queue,
+    and starts the FFmpeg decoder.
     """
     # Start the FFmpeg-based decoder in its own thread
     decoder_thread = threading.Thread(target=ffmpeg_decoder_writer, daemon=True)
@@ -111,17 +112,20 @@ def stream_audio(
 
     print("Starting audio stream from OpenAI using FFmpeg decoder...")
     try:
-        # Create a streaming response from the TTS API
-        with client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice,
-            input=text,
-            response_format="mp3",
-            instructions=instructions,
-        ) as response:
-            # For each MP3 chunk received from the API, put it on the queue.
-            for chunk in response.iter_bytes(chunk_size=1024):
-                mp3_buffer.put(chunk)
+        # Open file for saving the MP3 data
+        with open("output.mp3", "wb") as mp3_file:
+            # Create a streaming response from the TTS API
+            with client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice,
+                input=text,
+                response_format="mp3",
+                instructions=instructions,
+            ) as response:
+                # For each MP3 chunk received from the API, write to file and put it on the queue.
+                for chunk in response.iter_bytes(chunk_size=1024):
+                    mp3_file.write(chunk)
+                    mp3_buffer.put(chunk)
         # Once streaming is complete, set the event flag.
         streaming_complete.set()
         print("API streaming complete, waiting for playback to finish...")
