@@ -139,8 +139,8 @@ def stream_audio(
 if __name__ == "__main__":
     try:
         stream_audio(
-            text="Hi, this is Bill. I'm calling to let you know that your order has been delayed.",
-            instructions="Speak in a calm and professional tone.",
+            text="Hi, this is Bill. I'm calling to let you know a great investment opportunity that you don't want to miss. It will guarantee a 30% return on your investment in just 6 months.",
+            instructions="Speak in a excited tone.",
         )
         print("Audio streaming process finished")
     except KeyboardInterrupt:
