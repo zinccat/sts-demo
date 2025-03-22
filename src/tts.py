@@ -139,8 +139,8 @@ def stream_audio(
 if __name__ == "__main__":
     try:
         stream_audio(
-            text="Hello, world! This is a test of the OpenAI TTS API.",
-            instructions="Speak in a angry tone.",
+            text="Hi, this is Bill. I'm calling to let you know that your order has been delayed.",
+            instructions="Speak in a calm and professional tone.",
         )
         print("Audio streaming process finished")
     except KeyboardInterrupt:
