@@ -163,24 +163,9 @@ with gr.Blocks() as block:
     gr.HTML(
         """
         <h1 style='text-align: center;'>Voice Chat with Dynamic Emotions</h1>
-        <h3 style='text-align: center;'>Speak to the AI assistant and receive emotionally expressive responses</h3>
+        <h3 style='text-align: center;'>Speak to the AI assistant or type your message to receive emotionally expressive responses</h3>
         """
     )
-
-    with gr.Row():
-        with gr.Column(scale=1):
-            audio_in = gr.Audio(
-                label="Speak to the Assistant",
-                sources="microphone",
-                type="filepath",
-            )
-            input_text = gr.Textbox(label="Transcribed Text", lines=5)
-        with gr.Column(scale=2):
-            answer = gr.Textbox(label="Response Text", lines=5)
-            emotion = gr.Textbox(label="Emotional Style", lines=6)
-            audio_out = gr.Audio(
-                label="Assistant's Voice Response", autoplay=True, streaming=True
-            )
 
     with gr.Row():
         gr.HTML("""
@@ -191,10 +176,41 @@ with gr.Blocks() as block:
                 <li>Give me a quick recipe for dinner</li>
             </ul>
         """)
+        with gr.Column(scale=1):
+            audio_in = gr.Audio(
+                label="Speak to the Assistant",
+                sources="microphone",
+                type="filepath",
+            )
+            input_text = gr.Textbox(label="Or Type Your Message Here", lines=3)
+            submit_btn = gr.Button("Send Message")
+        with gr.Column(scale=2):
+            answer = gr.Textbox(label="Response Text", lines=5)
+            emotion = gr.Textbox(label="Emotional Style", lines=6)
+            audio_out = gr.Audio(
+                label="Assistant's Voice Response", autoplay=True, streaming=True
+            )
 
-    # Set up the event chain
+    # Set up the event chain for audio input
     audio_in.stop_recording(
         process_audio_sync, [audio_in], [answer, emotion, input_text]
+    ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
+
+    # Set up the event chain for text input
+    def process_text_input(text):
+        if not text:
+            return "", "", ""
+        response_data = asyncio.run(chat(text))
+        return response_data.response, response_data.emotion, text
+
+    # Connect the text input and button to the processing function
+    submit_btn.click(
+        process_text_input, input_text, [answer, emotion, input_text]
+    ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
+
+    # Also allow pressing Enter to submit
+    input_text.submit(
+        process_text_input, input_text, [answer, emotion, input_text]
     ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
 
 # Launch the Gradio interface
