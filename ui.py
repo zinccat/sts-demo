@@ -11,7 +11,6 @@ from typing import Optional
 from dotenv import load_dotenv
 import gradio as gr
 from openai import AsyncOpenAI
-from shutil import copyfile
 
 from src.sts import chat
 
@@ -115,14 +114,16 @@ class AudioStreamManager:
     async def stream_audio(
         self,
         text: str,
-        model: str = "tts-1",
+        model: str = "gpt-4o-mini-tts",
         voice: str = "alloy",
         instructions: Optional[str] = None,
     ):
         """
-        Stream audio from the OpenAI TTS API and yield audio chunks for real-time playback.
+        Stream audio from the OpenAI TTS API with smoother playback.
         """
-        mp3_buffer = io.BytesIO()
+        buffer = io.BytesIO()
+        min_chunk_size = 16384  # Minimum chunk size to yield (16KB)
+        last_position = 0
 
         try:
             async with client.audio.speech.with_streaming_response.create(
@@ -133,20 +134,20 @@ class AudioStreamManager:
                 instructions=instructions,
             ) as response:
                 async for chunk in response.iter_bytes(chunk_size=8192):
-                    # Save the chunk to our buffer
-                    mp3_buffer.write(chunk)
-                    # audio_chunks.append(chunk)
+                    # Append to our buffer
+                    buffer.write(chunk)
+                    current_size = buffer.tell()
 
-                    temp_buffer = io.BytesIO()
-                    temp_buffer.write(chunk)
-                    temp_buffer.seek(0)
+                    # Only yield if we've accumulated enough new data
+                    if current_size - last_position >= min_chunk_size:
+                        buffer.seek(0)
+                        yield buffer.getvalue()
+                        last_position = current_size
 
-                    # Yield the current accumulated audio
-                    yield temp_buffer.getvalue()
-
-            # Final yield for the complete audio
-            # mp3_buffer.seek(0)
-            # yield mp3_buffer.getvalue()
+            # Final yield if we have any remaining data
+            if buffer.tell() > last_position:
+                buffer.seek(0)
+                yield buffer.getvalue()
 
         except Exception as e:
             print(f"Error in streaming: {e}")
@@ -170,11 +171,9 @@ async def transcribe_audio(audio_file, model: str = "whisper-1") -> str:
 # ---------------------------------------------------------------------------
 async def process_audio(audio):
     gr.Info("Transcribing Audio", duration=5)
-    # copy audio file to input.wav
-    copyfile(audio, "input.wav")
 
     # Transcribe the audio
-    input_text = await transcribe_audio("input.wav")
+    input_text = await transcribe_audio(audio)
     gr.Info(f"Transcribed: {input_text}", duration=3)
 
     # Get response from the model
