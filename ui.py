@@ -1,3 +1,4 @@
+import io
 import os
 import queue
 import threading
@@ -20,20 +21,6 @@ from src.sts import chat
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-
-# ---------------------------------------------------------------------------
-# Data Models & Constants
-# ---------------------------------------------------------------------------
-
-
-async def transcribe_audio(audio_file, model: str = "whisper-1") -> str:
-    """
-    Transcribe audio using OpenAI's transcription API.
-    """
-    with open(audio_file, "rb") as file:
-        transcription = await client.audio.transcriptions.create(model=model, file=file)
-    return transcription.text
 
 
 # ---------------------------------------------------------------------------
@@ -133,42 +120,55 @@ class AudioStreamManager:
         instructions: Optional[str] = None,
     ):
         """
-        Stream audio from the OpenAI TTS API, writing MP3 data to a queue,
-        then decode and play it.
+        Stream audio from the OpenAI TTS API and yield audio chunks for real-time playback.
         """
-        # Start the FFmpeg decoder/player thread
-        threading.Thread(target=self.ffmpeg_decoder_writer).start()
+        mp3_buffer = io.BytesIO()
 
         try:
-            with open("output.mp3", "wb") as mp3_file:
-                async with client.audio.speech.with_streaming_response.create(
-                    model=model,
-                    voice=voice,
-                    input=text,
-                    response_format="mp3",
-                    instructions=instructions,
-                ) as response:
-                    async for chunk in response.iter_bytes(chunk_size=1024):
-                        mp3_file.write(chunk)
-                        self.mp3_buffer.put(chunk)
-            self.streaming_complete.set()
-            self.all_audio_played.wait(timeout=10)
-            return "output.mp3"
+            async with client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice,
+                input=text,
+                response_format="mp3",
+                instructions=instructions,
+            ) as response:
+                async for chunk in response.iter_bytes(chunk_size=8192):
+                    # Save the chunk to our buffer
+                    mp3_buffer.write(chunk)
+                    # audio_chunks.append(chunk)
+
+                    temp_buffer = io.BytesIO()
+                    temp_buffer.write(chunk)
+                    temp_buffer.seek(0)
+
+                    # Yield the current accumulated audio
+                    yield temp_buffer.getvalue()
+
+            # Final yield for the complete audio
+            # mp3_buffer.seek(0)
+            # yield mp3_buffer.getvalue()
+
         except Exception as e:
-            self.streaming_complete.set()
             print(f"Error in streaming: {e}")
-            return None
+            yield None
 
 
 # ---------------------------------------------------------------------------
 # Main Functions
 # ---------------------------------------------------------------------------
+async def transcribe_audio(audio_file, model: str = "whisper-1") -> str:
+    """
+    Transcribe audio using OpenAI's transcription API.
+    """
+    with open(audio_file, "rb") as file:
+        transcription = await client.audio.transcriptions.create(model=model, file=file)
+    return transcription.text
 
 
 # ---------------------------------------------------------------------------
 # Gradio Interface Functions
 # ---------------------------------------------------------------------------
-async def process_audio(audio: str):
+async def process_audio(audio):
     gr.Info("Transcribing Audio", duration=5)
     # copy audio file to input.wav
     copyfile(audio, "input.wav")
@@ -190,34 +190,43 @@ async def process_audio(audio: str):
     return answer, emotion, None
 
 
-async def generate_audio(answer, emotion):
-    if not answer:
-        return None
+def generate_audio_streaming(answer, emotion):
+    """Properly bridge the async generator to Gradio's sync world"""
 
-    # Create audio stream manager
+    # Create an audio manager
     audio_manager = AudioStreamManager()
 
-    # Stream the audio
-    audio_path = await audio_manager.stream_audio(text=answer, instructions=emotion)
+    # Create an event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    return audio_path
+    # Get the async generator
+    async_gen = audio_manager.stream_audio(text=answer, instructions=emotion)
+
+    try:
+        # Keep getting chunks until we're done
+        while True:
+            try:
+                # Get next chunk (this properly handles the async generator)
+                chunk = loop.run_until_complete(anext(async_gen))
+                # Only yield if we got a valid chunk
+                if chunk is not None:
+                    yield answer, chunk
+            except StopAsyncIteration:
+                # Generator is exhausted
+                break
+    finally:
+        # Clean up
+        loop.close()
 
 
-# Create synchronous wrapper functions for Gradio
+# Process audio function (synchronous wrapper)
 def process_audio_sync(audio):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     result = loop.run_until_complete(process_audio(audio))
     loop.close()
     return result
-
-
-def generate_audio_sync(answer, emotion):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(generate_audio(answer, emotion))
-    loop.close()
-    return result, answer, emotion
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +252,9 @@ with gr.Blocks() as block:
             with gr.Column(scale=2):
                 answer = gr.Textbox(label="Response Text", lines=5)
                 emotion = gr.Textbox(label="Emotional Style", lines=6)
-                audio_out = gr.Audio(label="Assistant's Voice Response", autoplay=True)
+                audio_out = gr.Audio(
+                    label="Assistant's Voice Response", autoplay=True, streaming=True
+                )
 
     with gr.Row():
         gr.HTML("""
@@ -257,8 +268,8 @@ with gr.Blocks() as block:
 
     # Set up the event chain
     audio_in.stop_recording(
-        process_audio_sync, audio_in, [answer, emotion, audio_out]
-    ).then(generate_audio_sync, [answer, emotion], [audio_out, answer, emotion])
+        process_audio_sync, [audio_in], [answer, emotion, audio_out]
+    ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
 
 # Launch the Gradio interface
 block.launch()
