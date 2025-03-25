@@ -112,11 +112,8 @@ async def transcribe_audio(audio_file, model: str = "gpt-4o-mini-transcribe") ->
 # Gradio Interface Functions
 # ---------------------------------------------------------------------------
 async def process_audio(audio):
-    gr.Info("Transcribing Audio", duration=5)
-
     # Transcribe the audio
     input_text = await transcribe_audio(audio)
-    gr.Info(f"Transcribed: {input_text}", duration=3)
 
     # Get response from the model
     try:
@@ -128,7 +125,7 @@ async def process_audio(audio):
         answer = "I couldn't process that request. Please try again."
         emotion = "Voice: Neutral\nTone: Calm\nDialect: Standard\nPronunciation: Clear\nFeatures: None"
 
-    return answer, emotion, None
+    return answer, emotion, input_text
 
 
 def generate_audio_streaming(answer, emotion):
@@ -177,6 +174,7 @@ with gr.Blocks() as block:
                 sources="microphone",
                 type="filepath",
             )
+            input_text = gr.Textbox(label="Transcribed Text", lines=5)
         with gr.Column(scale=2):
             answer = gr.Textbox(label="Response Text", lines=5)
             emotion = gr.Textbox(label="Emotional Style", lines=6)
@@ -196,7 +194,7 @@ with gr.Blocks() as block:
 
     # Set up the event chain
     audio_in.stop_recording(
-        process_audio_sync, [audio_in], [answer, emotion, audio_out]
+        process_audio_sync, [audio_in], [answer, emotion, input_text]
     ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
 
 # Launch the Gradio interface
