@@ -128,12 +128,12 @@ async def process_audio(audio):
     return answer, emotion, input_text
 
 
-def generate_audio_streaming(answer, emotion):
+def generate_audio_streaming(answer, emotion, voice="alloy"):
     """Bridge the async generator to Gradio's sync world"""
     audio_manager = AudioStreamManager()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    async_gen = audio_manager.stream_audio(text=answer, instructions=emotion)
+    async_gen = audio_manager.stream_audio(text=answer, instructions=emotion, voice=voice)
 
     try:
         while True:
@@ -159,6 +159,8 @@ def process_audio_sync(audio):
 # ---------------------------------------------------------------------------
 # Gradio Interface
 # ---------------------------------------------------------------------------
+voice_options = ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse"]
+
 with gr.Blocks() as block:
     gr.HTML(
         """
@@ -184,6 +186,11 @@ with gr.Blocks() as block:
             )
             input_text = gr.Textbox(label="Or Type Your Message Here", lines=3)
             submit_btn = gr.Button("Send Message")
+            voice = gr.Radio(
+                choices=voice_options,
+                label="Select Voice",
+                value="nova"  # Default selection
+            )
         with gr.Column(scale=2):
             answer = gr.Textbox(label="Response Text", lines=5)
             emotion = gr.Textbox(label="Emotional Style", lines=6)
@@ -194,7 +201,7 @@ with gr.Blocks() as block:
     # Set up the event chain for audio input
     audio_in.stop_recording(
         process_audio_sync, [audio_in], [answer, emotion, input_text]
-    ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
+    ).then(generate_audio_streaming, [answer, emotion, voice], [answer, audio_out])
 
     # Set up the event chain for text input
     def process_text_input(text):
@@ -206,12 +213,12 @@ with gr.Blocks() as block:
     # Connect the text input and button to the processing function
     submit_btn.click(
         process_text_input, input_text, [answer, emotion, input_text]
-    ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
+    ).then(generate_audio_streaming, [answer, emotion, voice], [answer, audio_out])
 
     # Also allow pressing Enter to submit
     input_text.submit(
         process_text_input, input_text, [answer, emotion, input_text]
-    ).then(generate_audio_streaming, [answer, emotion], [answer, audio_out])
+    ).then(generate_audio_streaming, [answer, emotion, voice], [answer, audio_out])
 
 # Launch the Gradio interface
 block.launch()
