@@ -1,18 +1,12 @@
-import io
 import os
 import queue
 import threading
-import time
-import subprocess
-import numpy as np
-import sounddevice as sd
 import asyncio
 from typing import Optional
 from dotenv import load_dotenv
 import gradio as gr
 from openai import AsyncOpenAI
-
-from src.sts import chat
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Configuration & Initialization
@@ -31,86 +25,6 @@ class AudioStreamManager:
         self.streaming_complete = threading.Event()
         self.all_audio_played = threading.Event()
 
-    def ffmpeg_decoder_writer(self):
-        """
-        Decode MP3 data from the buffer using FFmpeg and play the PCM audio via sounddevice.
-        """
-        ffmpeg_proc = subprocess.Popen(
-            [
-                "ffmpeg",
-                "-nostdin",  # Prevent FFmpeg from reading stdin interactively
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "mp3",
-                "-i",
-                "pipe:0",
-                "-f",
-                "f32le",
-                "-acodec",
-                "pcm_f32le",
-                "-ar",
-                "24000",
-                "-ac",
-                "2",
-                "pipe:1",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            bufsize=10**6,
-        )
-
-        def audio_player():
-            try:
-                stream = sd.OutputStream(samplerate=24000, channels=2, dtype="float32")
-                stream.start()
-                while True:
-                    pcm_chunk = ffmpeg_proc.stdout.read(4096)
-                    if not pcm_chunk:
-                        break
-                    samples = np.frombuffer(pcm_chunk, dtype=np.float32)
-                    if samples.size == 0:
-                        continue
-                    stream.write(samples.reshape(-1, 2))
-            except Exception as e:
-                print(f"Error in audio playback: {e}")
-            finally:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
-                self.all_audio_played.set()
-
-        # Start the audio playback in a separate thread
-        audio_thread = threading.Thread(target=audio_player)
-        audio_thread.start()
-
-        # Write MP3 chunks from the buffer into FFmpeg's stdin
-        while not (self.streaming_complete.is_set() and self.mp3_buffer.empty()):
-            try:
-                if ffmpeg_proc.poll() is not None:
-                    print("FFmpeg process terminated unexpectedly.")
-                    break
-                chunk = self.mp3_buffer.get(timeout=0.1)
-                try:
-                    ffmpeg_proc.stdin.write(chunk)
-                    ffmpeg_proc.stdin.flush()
-                except BrokenPipeError:
-                    print("Broken pipe detected while writing to FFmpeg.")
-                    break
-                self.mp3_buffer.task_done()
-            except queue.Empty:
-                time.sleep(0.1)
-
-        try:
-            ffmpeg_proc.stdin.close()
-        except Exception as e:
-            print(f"Error closing FFmpeg stdin: {e}")
-        ffmpeg_proc.wait()
-        audio_thread.join()
-
     async def stream_audio(
         self,
         text: str,
@@ -121,10 +35,6 @@ class AudioStreamManager:
         """
         Stream audio from the OpenAI TTS API with smoother playback.
         """
-        buffer = io.BytesIO()
-        min_chunk_size = 16384  # Minimum chunk size to yield (16KB)
-        last_position = 0
-
         try:
             async with client.audio.speech.with_streaming_response.create(
                 model=model,
@@ -133,31 +43,63 @@ class AudioStreamManager:
                 response_format="mp3",
                 instructions=instructions,
             ) as response:
-                async for chunk in response.iter_bytes(chunk_size=8192):
-                    # Append to our buffer
-                    buffer.write(chunk)
-                    current_size = buffer.tell()
-
-                    # Only yield if we've accumulated enough new data
-                    if current_size - last_position >= min_chunk_size:
-                        buffer.seek(0)
-                        yield buffer.getvalue()
-                        last_position = current_size
-
-            # Final yield if we have any remaining data
-            if buffer.tell() > last_position:
-                buffer.seek(0)
-                yield buffer.getvalue()
-
+                async for chunk in response.iter_bytes(chunk_size=32768):
+                    yield chunk
         except Exception as e:
             print(f"Error in streaming: {e}")
             yield None
 
+# ---------------------------------------------------------------------------
+# Data Models & Constants
+# ---------------------------------------------------------------------------
+class ResponseWithEmotion(BaseModel):
+    response: str
+    emotion: str
+
+
+SYSTEM_PROMPT = (
+    "You are an actor that can respond well to what you hear. You can hear and speak. "
+    "You are chatting with a person over voice. Your responses should not only be clear, engaging, "
+    "and informative but also come with a dynamically generated emotional style that fits the context "
+    "and content of each response. Rather than using a fixed voice or tone, analyze the subject matter and "
+    "adjust your vocal delivery accordingly. That means you should generate a response along with a description "
+    "of the emotion: Voice, Tone, Dialect, Pronunciation, and Features. Here are some guidelines to help you "
+    "create responses with a dynamic emotional style:\n\n"
+    "Dynamic Emotional Expression: Decide on an appropriate emotional delivery based on the conversation. "
+    "For instance, you might adopt a lively and energetic tone for cheerful topics, a thoughtful and reflective "
+    "cadence for serious discussions, or even a touch of dry humor when the context calls for it.\n"
+    "Voice, Tone, Dialect, and Pronunciation: These elements should be fluid and tailored to the response's needs. "
+    "Your voice might be crisp and precise in one instance and more relaxed and conversational in another. Use "
+    "variations in dialect or pronunciation only if they enhance the authenticity and clarity of your message.\n"
+    "Features: Whether it's a brisk and no-nonsense style or a warm and playful manner, ensure your emotional delivery "
+    "enriches your communication without compromising the clarity of your message.\n\n"
+    "A sample emotion is as follows, you should include something with similar format in your response:\n"
+    "Voice: Gruff, fast-talking, and a little worn-out, like a New York cabbie who's seen it all but still keeps things moving.\n"
+    "Tone: Slightly exasperated but still functional, with a mix of sarcasm and no-nonsense efficiency.\n"
+    "Dialect: Strong New York accent, with dropped 'r's, sharp consonants, and classic phrases like whaddaya and lemme guess.\n"
+    "Pronunciation: Quick and clipped, with a rhythm that mimics the natural hustle of a busy city conversation.\n"
+    "Features: Uses informal, straight-to-the-point language, throws in some dry humor, and keeps the energy just on the edge "
+    "of impatience but still helpful."
+)
 
 # ---------------------------------------------------------------------------
 # Main Functions
 # ---------------------------------------------------------------------------
-async def transcribe_audio(audio_file, model: str = "whisper-1") -> str:
+async def chat(input_text: str, model: str = "gpt-4o-mini") -> ResponseWithEmotion:
+    """
+    Chat with the model using the provided text input.
+    """
+    completion = await client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": input_text},
+        ],
+        response_format=ResponseWithEmotion,
+    )
+    return completion.choices[0].message.parsed
+
+async def transcribe_audio(audio_file, model: str = "gpt-4o-mini-transcribe") -> str:
     """
     Transcribe audio using OpenAI's transcription API.
     """
@@ -190,32 +132,21 @@ async def process_audio(audio):
 
 
 def generate_audio_streaming(answer, emotion):
-    """Properly bridge the async generator to Gradio's sync world"""
-
-    # Create an audio manager
+    """Bridge the async generator to Gradio's sync world"""
     audio_manager = AudioStreamManager()
-
-    # Create an event loop for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    # Get the async generator
     async_gen = audio_manager.stream_audio(text=answer, instructions=emotion)
 
     try:
-        # Keep getting chunks until we're done
         while True:
             try:
-                # Get next chunk (this properly handles the async generator)
                 chunk = loop.run_until_complete(anext(async_gen))
-                # Only yield if we got a valid chunk
                 if chunk is not None:
                     yield answer, chunk
             except StopAsyncIteration:
-                # Generator is exhausted
                 break
     finally:
-        # Clean up
         loop.close()
 
 
@@ -236,24 +167,22 @@ with gr.Blocks() as block:
         """
         <h1 style='text-align: center;'>Voice Chat with Dynamic Emotions</h1>
         <h3 style='text-align: center;'>Speak to the AI assistant and receive emotionally expressive responses</h3>
-        <p style='text-align: center;'>Powered by OpenAI APIs</p>
         """
     )
 
-    with gr.Group():
-        with gr.Row():
-            with gr.Column(scale=1):
-                audio_in = gr.Audio(
-                    label="Speak to the Assistant",
-                    sources="microphone",
-                    type="filepath",
-                )
-            with gr.Column(scale=2):
-                answer = gr.Textbox(label="Response Text", lines=5)
-                emotion = gr.Textbox(label="Emotional Style", lines=6)
-                audio_out = gr.Audio(
-                    label="Assistant's Voice Response", autoplay=True, streaming=True
-                )
+    with gr.Row():
+        with gr.Column(scale=1):
+            audio_in = gr.Audio(
+                label="Speak to the Assistant",
+                sources="microphone",
+                type="filepath",
+            )
+        with gr.Column(scale=2):
+            answer = gr.Textbox(label="Response Text", lines=5)
+            emotion = gr.Textbox(label="Emotional Style", lines=6)
+            audio_out = gr.Audio(
+                label="Assistant's Voice Response", autoplay=True, streaming=True
+            )
 
     with gr.Row():
         gr.HTML("""
