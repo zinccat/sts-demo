@@ -1,132 +1,264 @@
-import io
-from threading import Thread
-import random
 import os
-
-import numpy as np
-import spaces
-import gradio as gr
-import torch
-
-from parler_tts import ParlerTTSForConditionalGeneration
-from pydub import AudioSegment
-from transformers import AutoTokenizer, AutoFeatureExtractor, set_seed
-from huggingface_hub import InferenceClient
-from streamer import ParlerTTSStreamer
+import queue
+import threading
 import time
+import subprocess
+import numpy as np
+import sounddevice as sd
+import asyncio
+from typing import Optional
+from dotenv import load_dotenv
+import gradio as gr
+from openai import AsyncOpenAI
+from shutil import copyfile
+
+from src.sts import chat
+
+# ---------------------------------------------------------------------------
+# Configuration & Initialization
+# ---------------------------------------------------------------------------
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
-device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-torch_dtype = torch.float16 if device != "cpu" else torch.float32
-
-repo_id = "parler-tts/parler_tts_mini_v0.1"
-
-jenny_repo_id = "ylacombe/parler-tts-mini-jenny-30H"
-
-model = ParlerTTSForConditionalGeneration.from_pretrained(
-    jenny_repo_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True
-).to(device)
-
-client = InferenceClient(token=os.getenv("HF_TOKEN"))
-
-tokenizer = AutoTokenizer.from_pretrained(repo_id)
-feature_extractor = AutoFeatureExtractor.from_pretrained(repo_id)
-
-SAMPLE_RATE = feature_extractor.sampling_rate
-SEED = 42
+# ---------------------------------------------------------------------------
+# Data Models & Constants
+# ---------------------------------------------------------------------------
 
 
-def numpy_to_mp3(audio_array, sampling_rate):
-    # Normalize audio_array if it's floating-point
-    if np.issubdtype(audio_array.dtype, np.floating):
-        max_val = np.max(np.abs(audio_array))
-        audio_array = (audio_array / max_val) * 32767 # Normalize to 16-bit range
-        audio_array = audio_array.astype(np.int16)
-
-    # Create an audio segment from the numpy array
-    audio_segment = AudioSegment(
-        audio_array.tobytes(),
-        frame_rate=sampling_rate,
-        sample_width=audio_array.dtype.itemsize,
-        channels=1
-    )
-
-    # Export the audio segment to MP3 bytes - use a high bitrate to maximise quality
-    mp3_io = io.BytesIO()
-    audio_segment.export(mp3_io, format="mp3", bitrate="320k")
-
-    # Get the MP3 bytes
-    mp3_bytes = mp3_io.getvalue()
-    mp3_io.close()
-
-    return mp3_bytes
-
-sampling_rate = model.audio_encoder.config.sampling_rate
-frame_rate = model.audio_encoder.config.frame_rate
+async def transcribe_audio(audio_file, model: str = "whisper-1") -> str:
+    """
+    Transcribe audio using OpenAI's transcription API.
+    """
+    with open(audio_file, "rb") as file:
+        transcription = await client.audio.transcriptions.create(model=model, file=file)
+    return transcription.text
 
 
-def generate_response(audio):
+# ---------------------------------------------------------------------------
+# Audio Streaming & Playback Manager
+# ---------------------------------------------------------------------------
+class AudioStreamManager:
+    def __init__(self):
+        self.mp3_buffer = queue.Queue()
+        self.streaming_complete = threading.Event()
+        self.all_audio_played = threading.Event()
+
+    def ffmpeg_decoder_writer(self):
+        """
+        Decode MP3 data from the buffer using FFmpeg and play the PCM audio via sounddevice.
+        """
+        ffmpeg_proc = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-nostdin",  # Prevent FFmpeg from reading stdin interactively
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "mp3",
+                "-i",
+                "pipe:0",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-ar",
+                "24000",
+                "-ac",
+                "2",
+                "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            bufsize=10**6,
+        )
+
+        def audio_player():
+            try:
+                stream = sd.OutputStream(samplerate=24000, channels=2, dtype="float32")
+                stream.start()
+                while True:
+                    pcm_chunk = ffmpeg_proc.stdout.read(4096)
+                    if not pcm_chunk:
+                        break
+                    samples = np.frombuffer(pcm_chunk, dtype=np.float32)
+                    if samples.size == 0:
+                        continue
+                    stream.write(samples.reshape(-1, 2))
+            except Exception as e:
+                print(f"Error in audio playback: {e}")
+            finally:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+                self.all_audio_played.set()
+
+        # Start the audio playback in a separate thread
+        audio_thread = threading.Thread(target=audio_player)
+        audio_thread.start()
+
+        # Write MP3 chunks from the buffer into FFmpeg's stdin
+        while not (self.streaming_complete.is_set() and self.mp3_buffer.empty()):
+            try:
+                if ffmpeg_proc.poll() is not None:
+                    print("FFmpeg process terminated unexpectedly.")
+                    break
+                chunk = self.mp3_buffer.get(timeout=0.1)
+                try:
+                    ffmpeg_proc.stdin.write(chunk)
+                    ffmpeg_proc.stdin.flush()
+                except BrokenPipeError:
+                    print("Broken pipe detected while writing to FFmpeg.")
+                    break
+                self.mp3_buffer.task_done()
+            except queue.Empty:
+                time.sleep(0.1)
+
+        try:
+            ffmpeg_proc.stdin.close()
+        except Exception as e:
+            print(f"Error closing FFmpeg stdin: {e}")
+        ffmpeg_proc.wait()
+        audio_thread.join()
+
+    async def stream_audio(
+        self,
+        text: str,
+        model: str = "tts-1",
+        voice: str = "alloy",
+        instructions: Optional[str] = None,
+    ):
+        """
+        Stream audio from the OpenAI TTS API, writing MP3 data to a queue,
+        then decode and play it.
+        """
+        # Start the FFmpeg decoder/player thread
+        threading.Thread(target=self.ffmpeg_decoder_writer).start()
+
+        try:
+            with open("output.mp3", "wb") as mp3_file:
+                async with client.audio.speech.with_streaming_response.create(
+                    model=model,
+                    voice=voice,
+                    input=text,
+                    response_format="mp3",
+                    instructions=instructions,
+                ) as response:
+                    async for chunk in response.iter_bytes(chunk_size=1024):
+                        mp3_file.write(chunk)
+                        self.mp3_buffer.put(chunk)
+            self.streaming_complete.set()
+            self.all_audio_played.wait(timeout=10)
+            return "output.mp3"
+        except Exception as e:
+            self.streaming_complete.set()
+            print(f"Error in streaming: {e}")
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Main Functions
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Gradio Interface Functions
+# ---------------------------------------------------------------------------
+async def process_audio(audio: str):
     gr.Info("Transcribing Audio", duration=5)
-    question = client.automatic_speech_recognition(audio).text
-    messages = [{"role": "system", "content": ("You are a magic 8 ball."
-                                              "Someone will present to you a situation or question and your job "
-                                              "is to answer with a cryptic addage or proverb such as "
-                                              "'curiosity killed the cat' or 'The early bird gets the worm'."
-                                              "Keep your answers short and do not include the phrase 'Magic 8 Ball' in your response. If the question does not make sense or is off-topic, say 'Foolish questions get foolish answers.'"
-                                              "For example, 'Magic 8 Ball, should I get a dog?', 'A dog is ready for you but are you ready for the dog?'")},
-                {"role": "user", "content": f"Magic 8 Ball please answer this question -  {question}"}]
-    
-    response = client.chat_completion(messages, max_tokens=64, seed=random.randint(1, 5000), model="mistralai/Mistral-7B-Instruct-v0.3")
-    response = response.choices[0].message.content.replace("Magic 8 Ball", "")
-    return response, None, None
+    # copy audio file to input.wav
+    copyfile(audio, "input.wav")
 
-@spaces.GPU
-def read_response(answer):
+    # Transcribe the audio
+    input_text = await transcribe_audio("input.wav")
+    gr.Info(f"Transcribed: {input_text}", duration=3)
 
-    play_steps_in_s = 2.0
-    play_steps = int(frame_rate * play_steps_in_s)
+    # Get response from the model
+    try:
+        response_data = await chat(input_text)
+        answer = response_data.response
+        emotion = response_data.emotion
+    except Exception as e:
+        print(f"Error getting response: {e}")
+        answer = "I couldn't process that request. Please try again."
+        emotion = "Voice: Neutral\nTone: Calm\nDialect: Standard\nPronunciation: Clear\nFeatures: None"
 
-    description = "Jenny speaks at an average pace with a calm delivery in a very confined sounding environment with clear audio quality."
-    description_tokens = tokenizer(description, return_tensors="pt").to(device)
-
-    streamer = ParlerTTSStreamer(model, device=device, play_steps=play_steps)
-    prompt = tokenizer(answer, return_tensors="pt").to(device)
-
-    generation_kwargs = dict(
-        input_ids=description_tokens.input_ids,
-        prompt_input_ids=prompt.input_ids,
-        streamer=streamer,
-        do_sample=True,
-        temperature=1.0,
-        min_new_tokens=10,
-    )
-
-    set_seed(SEED)
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
-    start = time.time()
-    for new_audio in streamer:
-        print(f"Sample of length: {round(new_audio.shape[0] / sampling_rate, 2)} seconds after {time.time() - start} seconds")
-        yield answer, numpy_to_mp3(new_audio, sampling_rate=sampling_rate)
+    return answer, emotion, None
 
 
+async def generate_audio(answer, emotion):
+    if not answer:
+        return None
+
+    # Create audio stream manager
+    audio_manager = AudioStreamManager()
+
+    # Stream the audio
+    audio_path = await audio_manager.stream_audio(text=answer, instructions=emotion)
+
+    return audio_path
+
+
+# Create synchronous wrapper functions for Gradio
+def process_audio_sync(audio):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(process_audio(audio))
+    loop.close()
+    return result
+
+
+def generate_audio_sync(answer, emotion):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(generate_audio(answer, emotion))
+    loop.close()
+    return result, answer, emotion
+
+
+# ---------------------------------------------------------------------------
+# Gradio Interface
+# ---------------------------------------------------------------------------
 with gr.Blocks() as block:
     gr.HTML(
-        f"""
-        <h1 style='text-align: center;'> Magic 8 Ball 🎱 </h1>
-        <h3 style='text-align: center;'> Ask a question and receive wisdom </h3>
-        <p style='text-align: center;'> Powered by <a href="https://github.com/huggingface/parler-tts"> Parler-TTS</a>
+        """
+        <h1 style='text-align: center;'>Voice Chat with Dynamic Emotions</h1>
+        <h3 style='text-align: center;'>Speak to the AI assistant and receive emotionally expressive responses</h3>
+        <p style='text-align: center;'>Powered by OpenAI APIs</p>
         """
     )
+
     with gr.Group():
         with gr.Row():
-            audio_out = gr.Audio(label="Spoken Answer", streaming=True, autoplay=True, loop=False)
-            answer = gr.Textbox(label="Answer")
-            state = gr.State()
-        with gr.Row():
-            audio_in = gr.Audio(label="Speak you question", sources="microphone", type="filepath")
-    with gr.Row():
-        gr.HTML("""<h3 style='text-align: center;'> Examples: 'What is the meaning of life?', 'Should I get a dog?' </h3>""")
-    audio_in.stop_recording(generate_response, audio_in, [state, answer, audio_out]).then(fn=read_response, inputs=state, outputs=[answer, audio_out])
+            with gr.Column(scale=1):
+                audio_in = gr.Audio(
+                    label="Speak to the Assistant",
+                    sources="microphone",
+                    type="filepath",
+                )
+            with gr.Column(scale=2):
+                answer = gr.Textbox(label="Response Text", lines=5)
+                emotion = gr.Textbox(label="Emotional Style", lines=6)
+                audio_out = gr.Audio(label="Assistant's Voice Response", autoplay=True)
 
+    with gr.Row():
+        gr.HTML("""
+            <h3 style='text-align: center;'>Example conversation starters:</h3>
+            <ul style='text-align: center; list-style-position: inside;'>
+                <li>Tell me about the weather today</li>
+                <li>What's your favorite movie?</li>
+                <li>Give me a quick recipe for dinner</li>
+            </ul>
+        """)
+
+    # Set up the event chain
+    audio_in.stop_recording(
+        process_audio_sync, audio_in, [answer, emotion, audio_out]
+    ).then(generate_audio_sync, [answer, emotion], [audio_out, answer, emotion])
+
+# Launch the Gradio interface
 block.launch()
